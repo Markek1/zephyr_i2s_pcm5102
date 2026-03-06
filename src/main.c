@@ -5,28 +5,28 @@
 #include <zephyr/sys/atomic.h>
 
 /* ==== Audio format ==== */
-#define SAMPLE_RATE 11025
+#define SAMPLE_RATE 48000
 #define SAMPLE_BIT_WIDTH 16
 #define NUM_CHANNELS 2
 #define BYTES_PER_SAMPLE (SAMPLE_BIT_WIDTH / 8)
 
-/* ~23.2 ms per block => crisp 1s on/off edges (and small fades) */
-#define SAMPLES_PER_BLOCK 256 /* frames per channel */
+/* ~21.3 ms per block at 48kHz */
+#define SAMPLES_PER_BLOCK 1024 /* frames per channel */
 #define SAMPLES_PER_BUFFER (SAMPLES_PER_BLOCK * NUM_CHANNELS)
 #define BUFFER_SIZE_BYTES (SAMPLES_PER_BUFFER * BYTES_PER_SAMPLE)
 BUILD_ASSERT(BYTES_PER_SAMPLE == 2, "Only 16-bit samples are used here.");
 
 /* Device */
-#define I2S_DEV DT_NODELABEL(i2s0)
+#define I2S_DEV DT_ALIAS(i2s_tx)
 
 /* Driver TX slab (internal queue). App does NOT allocate from this when using
  * i2s_buf_write(). */
-K_MEM_SLAB_DEFINE(tx_mem_slab, BUFFER_SIZE_BYTES, 4, 4);
+K_MEM_SLAB_DEFINE(tx_mem_slab, BUFFER_SIZE_BYTES, 8, 4);
 
 /* App queue: main() -> feeder; we pass pointers to raw buffers to be copied by
  * i2s_buf_write(). */
 #define QUEUE_DEPTH 4
-K_MSGQ_DEFINE(audio_q, sizeof(void *), QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(audio_q, sizeof(void*), QUEUE_DEPTH, 4);
 
 /* ==== Tone generator (LUT) ==== */
 #define SINE_TABLE_SIZE 256
@@ -67,7 +67,7 @@ static int16_t buf_pong[SAMPLES_PER_BUFFER];
 static int16_t zeros[SAMPLES_PER_BUFFER];
 
 /* Small fades to avoid ticks on transitions */
-static inline void apply_fade(int16_t *buf, bool fade_in) {
+static inline void apply_fade(int16_t* buf, bool fade_in) {
     const int n = (int)(SAMPLE_RATE * 0.005f); /* ~5 ms worth of frames */
     const int m = (n < SAMPLES_PER_BLOCK) ? n : SAMPLES_PER_BLOCK;
     for (int i = 0; i < m; i++) {
@@ -79,7 +79,7 @@ static inline void apply_fade(int16_t *buf, bool fade_in) {
     }
 }
 
-static inline void gen_sine_block(int16_t *buf) {
+static inline void gen_sine_block(int16_t* buf) {
     for (uint32_t i = 0; i < SAMPLES_PER_BLOCK; i++) {
         uint32_t idx = (phase_acc >> 16) & (SINE_TABLE_SIZE - 1);
         int16_t s = sine_lut[idx];
@@ -97,43 +97,53 @@ static struct k_thread audio_thread;
 
 static atomic_t g_recoveries = ATOMIC_INIT(0);
 
-static void audio_feeder(void *, void *, void *) {
-    const struct device *i2s = DEVICE_DT_GET(I2S_DEV);
+/* Workaround: SAI_TxReset() clears MCR.MOE. Re-apply after configure. */
+static inline void fix_sai0_mcr_moe(void) {
+    volatile uint32_t* sai_mcr = (volatile uint32_t*)(0x50106000 + 0x100);
+    *sai_mcr |= (1u << 30); /* MCR.MOE = 1 */
+}
+
+static const struct i2s_config tx_cfg = {
+    .word_size = SAMPLE_BIT_WIDTH,
+    .channels = NUM_CHANNELS,
+    .format = I2S_FMT_DATA_FORMAT_I2S,
+    .options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER,
+    .frame_clk_freq = SAMPLE_RATE,
+    .mem_slab = &tx_mem_slab,
+    .block_size = BUFFER_SIZE_BYTES,
+    .timeout = 100,
+};
+
+static int i2s_start_stream(const struct device* i2s) {
+    /* Configure (or re-configure) */
+    int r = i2s_configure(i2s, I2S_DIR_TX, (struct i2s_config*)&tx_cfg);
+    if (r < 0) return r;
+    fix_sai0_mcr_moe();
+
+    /* Prefill with silence */
+    for (int i = 0; i < 4; i++) {
+        r = i2s_buf_write(i2s, zeros, BUFFER_SIZE_BYTES);
+        if (r < 0) return r;
+    }
+
+    return i2s_trigger(i2s, I2S_DIR_TX, I2S_TRIGGER_START);
+}
+
+static void audio_feeder(void*, void*, void*) {
+    const struct device* i2s = DEVICE_DT_GET(I2S_DEV);
     if (!device_is_ready(i2s)) {
         printk("I2S not ready\n");
         return;
     }
 
-    struct i2s_config cfg = {
-        .word_size = SAMPLE_BIT_WIDTH,
-        .channels = NUM_CHANNELS,
-        .format = I2S_FMT_DATA_FORMAT_I2S,
-        .options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER,
-        .frame_clk_freq = SAMPLE_RATE,
-        .mem_slab = &tx_mem_slab,
-        .block_size = BUFFER_SIZE_BYTES,
-        .timeout = 50, /* ms: finite to avoid deadlocks */
-    };
-
-    if (i2s_configure(i2s, I2S_DIR_TX, &cfg) < 0) {
-        printk("i2s_configure failed\n");
-        return;
-    }
-
-    /* Prefill 2 blocks so we hear something immediately */
-    gen_sine_block(buf_ping);
-    (void)i2s_buf_write(i2s, buf_ping, BUFFER_SIZE_BYTES);
-    gen_sine_block(buf_pong);
-    (void)i2s_buf_write(i2s, buf_pong, BUFFER_SIZE_BYTES);
-
-    if (i2s_trigger(i2s, I2S_DIR_TX, I2S_TRIGGER_START) < 0) {
-        printk("I2S START failed\n");
+    if (i2s_start_stream(i2s) < 0) {
+        printk("I2S start failed\n");
         return;
     }
     printk("Feeder running.\n");
 
     while (1) {
-        void *payload = NULL;
+        void* payload = NULL;
 
         if (k_msgq_get(&audio_q, &payload, K_NO_WAIT) == 0) {
             /* App supplied a block */
@@ -141,23 +151,21 @@ static void audio_feeder(void *, void *, void *) {
             payload = zeros; /* fallback to silence */
         }
 
-        int r;
-        do {
-            r = i2s_buf_write(i2s, payload, BUFFER_SIZE_BYTES);
-            if (r == -EAGAIN) k_sleep(K_MSEC(1));
-        } while (r == -EAGAIN);
+        int r = i2s_buf_write(i2s, payload, BUFFER_SIZE_BYTES);
 
-        if (r < 0) {
+        if (r == -EIO) {
+            /* Stream entered ERROR or was PAUSED due to underrun.
+             * Stop, drop, reconfigure, restart. */
             atomic_inc(&g_recoveries);
-            printk("audio: write=%d, recovering\n", r);
-            (void)i2s_trigger(i2s, I2S_DIR_TX, I2S_TRIGGER_STOP);
+            printk("audio: recovering (r=%d)\n", r);
             (void)i2s_trigger(i2s, I2S_DIR_TX, I2S_TRIGGER_DROP);
-            (void)i2s_buf_write(i2s, zeros, BUFFER_SIZE_BYTES);
-            (void)i2s_buf_write(i2s, zeros, BUFFER_SIZE_BYTES);
-            (void)i2s_trigger(i2s, I2S_DIR_TX, I2S_TRIGGER_START);
+            if (i2s_start_stream(i2s) < 0) {
+                printk("audio: restart failed\n");
+            }
+        } else if (r == -EAGAIN) {
+            /* Slab full, wait a bit */
+            k_sleep(K_MSEC(1));
         }
-
-        k_yield(); /* keep it polite even though we outrank main */
     }
 }
 
@@ -214,7 +222,7 @@ int main(void) {
 
         /* Produce exactly one block per period (or nothing during silence) */
         if (tone_on || pending_fade_out) {
-            int16_t *b = (cur == 0) ? buf_ping : buf_pong;
+            int16_t* b = (cur == 0) ? buf_ping : buf_pong;
             gen_sine_block(b);
             if (tone_on && !prev_tone_on)
                 apply_fade(b, true); /* fade-in on first tone block */

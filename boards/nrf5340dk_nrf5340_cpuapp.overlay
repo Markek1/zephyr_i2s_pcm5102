@@ -18,3 +18,9 @@
 &clock {
 	hfclkaudio-frequency = <2822400>;
 };
+
+/ {
+	aliases {
+		i2s-tx = &i2s0;
+	};
+};

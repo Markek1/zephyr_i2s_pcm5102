@@ -1,0 +1,32 @@
+/* FRDM-MCXN947: route PCM5102 output via SAI0 (mcux-i2s).
+ *
+ * nxp,tx-channel is a bitmask: 1 = TXD0 enabled (the pinmuxed data line).
+ * The SoC dtsi default of 1 is correct for TXD0, so we don't override it.
+ *
+ * SAI0 pins: TXD0=PIO2_2, TX_BCLK=PIO2_6, TX_FS=PIO2_7.
+ * These pins are shared with sc_timer, flexpwm1_pwm0, and usdhc0 which
+ * the board enables by default — disable them to avoid pin-mux conflicts.
+ */
+
+&sai0 {
+	status = "okay";
+};
+
+/* Disable peripherals that conflict with SAI0 on PIO2_2 / PIO2_6 / PIO2_7 */
+&sc_timer {
+	status = "disabled";
+};
+
+&flexpwm1_pwm0 {
+	status = "disabled";
+};
+
+&usdhc0 {
+	status = "disabled";
+};
+
+/ {
+	aliases {
+		i2s-tx = &sai0;
+	};
+};
